@@ -1,0 +1,145 @@
+---
+title: "03 — Pairwise site distances"
+author: "Alexander Hobbs"
+output: html_document
+---
+
+<!--
+Calculates great-circle pairwise distances between all blue tit nest box
+sites using the Haversine formula. Produces the distance matrix used by
+the Gaussian spatial autocorrelation model in 05_results_distance_decay.Rmd
+and the distribution plot for Appendix Figure 6.
+
+Inputs (data/):
+  - site_details.csv
+
+Outputs (data/):
+  - Pairwise_distance_km.csv : tidy long-format table of unique site pairs
+                               and their pairwise distances in km.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(geosphere)
+library(ggplot2)
+```
+
+```{r load-site-data}
+site_details <- read.csv("data/site_details.csv",
+                         stringsAsFactors = FALSE, header = TRUE)
+
+# Keep only the columns needed and exclude TOM
+sites <- site_details %>%
+  filter(site != "TOM") %>%
+  select(site, Name, Mean.Lat, Mean.Long) %>%
+  drop_na(Mean.Lat, Mean.Long)
+
+cat("Number of sites:", nrow(sites), "\n")
+```
+
+```{r calculate-pairwise-distances}
+# Extract coordinates as a matrix (lon, lat order required by geosphere)
+coords <- sites %>% select(Mean.Long, Mean.Lat) %>% as.matrix()
+
+# Calculate pairwise distances (in metres), convert to km
+dist_matrix_km <- distm(coords, fun = distHaversine) / 1000
+
+# Label rows and columns with site codes
+rownames(dist_matrix_km) <- sites$site
+colnames(dist_matrix_km) <- sites$site
+
+# Convert to a tidy long-format data frame, deduplicate (A-B == B-A)
+dist_long <- as.data.frame(as.table(dist_matrix_km)) %>%
+  rename(site1 = Var1, site2 = Var2, distance_km = Freq) %>%
+  filter(site1 != site2) %>%
+  mutate(pair = paste(pmin(as.character(site1), as.character(site2)),
+                      pmax(as.character(site1), as.character(site2)),
+                      sep = "-")) %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  select(site1, site2, distance_km)
+
+cat("Total unique site pairs:", nrow(dist_long), "\n")
+summary(dist_long$distance_km)
+
+# Calculate the median distance (used in the histogram annotation below)
+median_dist <- median(dist_long$distance_km)
+```
+
+```{r closest-pairs}
+cat("--- 10 closest pairs ---\n")
+dist_long %>% arrange(distance_km) %>% head(10)
+```
+
+```{r furthest-pairs}
+cat("--- 10 most distant pairs ---\n")
+dist_long %>% arrange(desc(distance_km)) %>% head(10)
+```
+
+```{r distance-histogram}
+# Appendix Figure 6: distribution of pairwise distances
+ggplot(dist_long, aes(x = distance_km)) +
+  geom_histogram(
+    binwidth  = 10,
+    fill      = "grey60",
+    colour    = "grey20",
+    linewidth = 0.3
+  ) +
+  geom_vline(
+    xintercept = median_dist,
+    colour     = "black",
+    linetype   = "dashed",
+    linewidth  = 0.6
+  ) +
+  annotate(
+    "text",
+    x         = median_dist,
+    y         = Inf,
+    label     = paste0("Median = ", round(median_dist, 1), " km"),
+    hjust     = -0.1,
+    vjust     = 2,
+    family    = "Palatino",
+    size      = 3.8,
+    fontface  = "italic"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, ceiling(max(dist_long$distance_km) / 25) * 25, by = 25),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Pairwise distance (km)",
+       y = "Number of site pairs") +
+  theme_classic(base_size = 12, base_family = "Palatino") +
+  theme(
+    axis.title  = element_text(size = 12),
+    axis.text   = element_text(size = 10, colour = "black"),
+    axis.ticks  = element_line(colour = "black"),
+    plot.margin = margin(10, 15, 10, 10)
+  )
+```
+
+```{r distance-heatmap, fig.width = 9, fig.height = 8}
+# Heatmap of the full distance matrix, ordered by latitude
+dist_long_full <- as.data.frame(as.table(dist_matrix_km)) %>%
+  rename(site1 = Var1, site2 = Var2, distance_km = Freq)
+
+site_order <- sites %>% arrange(Mean.Lat) %>% pull(site)
+dist_long_full$site1 <- factor(dist_long_full$site1, levels = site_order)
+dist_long_full$site2 <- factor(dist_long_full$site2, levels = site_order)
+
+ggplot(dist_long_full, aes(x = site1, y = site2, fill = distance_km)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Distance (km)", option = "magma", direction = -1) +
+  labs(x = "Site", y = "Site") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+```{r export-distances}
+# Save for use in 05_results_distance_decay.Rmd
+write.csv(dist_long, "data/Pairwise_distance_km.csv", row.names = FALSE)
+cat("Saved data/Pairwise_distance_km.csv\n")
+```

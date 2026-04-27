@@ -1,0 +1,122 @@
+---
+title: "Check — 2020 lay-date exclusion"
+author: "Alexander Hobbs"
+output: html_document
+---
+
+<!--
+Diagnostic / sensitivity analysis supporting the exclusion of 2020 lay-date
+data from main analyses (described in Methods 2.2).
+
+Reduced fieldwork during COVID-19 disruption meant only ~20 first-egg-date
+observations across few sites were available in 2020. This script:
+  1. Quantifies the 2020 lay-date data gap.
+  2. Refits the lay-date -> clutch-size cascade model with vs without 2020
+     to show the practical impact on parameter estimates is negligible.
+
+Inputs (from data/, produced by 01_data_cleaning.Rmd):
+  - Blue_tits_final.csv
+  - Blue_tits_cleaned.csv
+  - FED_Blue_tits_exc_2020.csv
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+```
+
+```{r load-data}
+Blue_tits_final        <- read.csv("data/Blue_tits_final.csv",
+                                   stringsAsFactors = FALSE)
+Blue_tits_cleaned      <- read.csv("data/Blue_tits_cleaned.csv",
+                                   stringsAsFactors = FALSE)
+FED_Blue_tits_exc_2020 <- read.csv("data/FED_Blue_tits_exc_2020.csv",
+                                   stringsAsFactors = FALSE)
+
+# siteyear column needed by mixed models below
+Blue_tits_final$siteyear        <- paste(Blue_tits_final$site,
+                                          Blue_tits_final$year)
+FED_Blue_tits_exc_2020$siteyear <- paste(FED_Blue_tits_exc_2020$site,
+                                          FED_Blue_tits_exc_2020$year)
+
+# site-level aggregates for site_means reference below
+site_means <- Blue_tits_final %>%
+  group_by(site, year) %>%
+  summarise(mean_cs  = mean(cs,  na.rm = TRUE),
+            mean_suc = mean(suc, na.rm = TRUE),
+            .groups = "drop")
+```
+
+## 1. How much lay-date data is in 2020?
+
+```{r investigate-2020-fed}
+# Number of FED (first egg date) observations in 2020
+Blue_tits_final %>%
+  filter(year == 2020) %>%
+  summarise(n_fed_obs   = sum(!is.na(fed)),
+            n_sites     = n_distinct(site[!is.na(fed)]),
+            total_sites = n_distinct(site))
+
+# Which sites have FED data in 2020?
+Blue_tits_final %>%
+  filter(year == 2020, !is.na(fed)) %>%
+  group_by(site) %>%
+  summarise(n_obs = n(), .groups = "drop")
+
+# What proportion of the total FED dataset is 2020?
+Blue_tits_final %>%
+  summarise(total_fed = sum(!is.na(fed)),
+            fed_2020  = sum(!is.na(fed) & year == 2020),
+            pct_2020  = round(100 * sum(!is.na(fed) & year == 2020)
+                              / sum(!is.na(fed)), 1))
+```
+
+## 2. Sensitivity check: model with vs without 2020
+
+```{r sensitivity-check-2020-fed}
+# Cascade model (lay date predicting clutch size) WITH 2020 included
+cs_fed_with2020 <- lmer(cs ~ fed + (1|year) + (1|site) + (1|siteyear),
+                        data = Blue_tits_final %>% drop_na(fed, cs))
+
+# Same model WITHOUT 2020
+cs_fed_without2020 <- lmer(cs ~ fed + (1|year) + (1|site) + (1|siteyear),
+                           data = FED_Blue_tits_exc_2020 %>% drop_na(fed, cs))
+
+# Helper: extract ICC from the year random effect
+extract_icc <- function(model) {
+  v <- tidy(model, effects = "ran_pars", scales = "vcov")
+  yr <- v$estimate[v$group == "year"]
+  sy <- v$estimate[v$group == "siteyear"]
+  round(yr / (yr + sy), 3)
+}
+
+cat("ICC with 2020:        ", extract_icc(cs_fed_with2020),   "\n")
+cat("ICC without 2020:     ", extract_icc(cs_fed_without2020), "\n")
+cat("FED slope with 2020:    ", round(fixef(cs_fed_with2020)["fed"],    4), "\n")
+cat("FED slope without 2020: ", round(fixef(cs_fed_without2020)["fed"], 4), "\n")
+```
+
+Sensitivity analyses confirmed that inclusion or exclusion of 2020 lay-date
+observations had negligible impact on model estimates, supporting the
+decision to exclude 2020 lay-date data on the grounds that the small number
+of observations across few sites yields unreliable site-mean estimates for
+that year.
+
+## 3. Site count sanity check
+
+```{r site-counts}
+cat("Sites before any exclusions:  ", n_distinct(Blue_tits_cleaned$site), "\n")
+cat("Sites after removing TOM:     ", n_distinct(Blue_tits_final$site),  "\n")
+cat("Sites in site_means:          ", n_distinct(site_means$site), "\n\n")
+
+cat("Sites in cleaned set:\n")
+sort(unique(Blue_tits_cleaned$site))
+cat("\nSites in final set:\n")
+sort(unique(Blue_tits_final$site))
+```

@@ -1,0 +1,388 @@
+---
+title: "06 — Distance-decay (Gaussian spatial autocorrelation)"
+author: "Alexander Hobbs"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+<!--
+Fits the Gaussian spatial autocorrelation model from Engen et al. (2005),
+following Vriend et al. (2022), to characterise distance-decay of synchrony
+in lay date, clutch size, and fledgling success across the Phenoweb
+transect. Reproduces Table 3 and Figure 4 of the dissertation.
+
+Parameters fitted:
+  rho_0  : zero-distance synchrony
+  rho_inf: synchrony at infinite distance
+  l      : spatial scale parameter (km)
+
+Inputs (data/, produced by 01_data_cleaning.Rmd and earlier scripts):
+  - Blue_tits_cleaned.csv
+  - site_means.csv, site_details.csv
+  - Pairwise_correlations.csv (precomputed pairwise Pearson r)
+  - icc_baseline.csv (output from 04_results_synchrony_iccs.Rmd)
+  - site_means_with_temp.csv, climate_data.csv
+
+Bootstrapping: parametric bootstraps (n_boot = 5000) cached as
+  boot_results_aim2.rds. Random seed 42 set before the run-bootstraps chunk
+  for reproducibility.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+                      fig.align = "center", dpi = 300)
+```
+
+```{r load-libraries}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(corrr)
+library(reshape2)
+library(ncf)
+library(mvtnorm)
+library(matrixStats)
+library(progress)
+library(patchwork)
+library(scales)
+library(ggforce)
+library(viridis)
+library(geosphere)
+```
+
+***
+
+# Data loading and cleaning
+
+```{r load-data}
+site_means <- read.csv(
+  "data/site_means.csv",
+  stringsAsFactors = FALSE, header = TRUE)
+
+site_details <- read.csv(
+  "data/site_details.csv",
+  stringsAsFactors = FALSE, header = TRUE)
+
+Blue_tits_cleaned <- read.csv(
+  'data/Blue_tits_cleaned.csv',
+  stringsAsFactors = TRUE, header = TRUE)
+
+Pairwise_correlations <- read.csv(
+  "data/Pairwise_correlations.csv",
+  stringsAsFactors = FALSE, header = TRUE)
+
+icc_baseline <- read.csv(
+  "data/icc_baseline.csv")
+
+site_means_with_temp <- read.csv(
+  "data/site_means_with_temp.csv",
+  stringsAsFactors = FALSE, header = TRUE)
+
+climate_data <- read.csv(
+  "data/climate_data.csv",
+  stringsAsFactors = FALSE, header = TRUE)
+```
+
+```{r data-cleaning}
+# 1. Clean site-level data
+site_means <- site_means %>% 
+  filter(site != "TOM")
+
+site_details <- site_details %>% 
+  filter(site != "TOM")
+
+# 2. Clean nest-level data (Blue_tits_final)
+# This removes site 'TOM' and clutch sizes > 16 (dump nests), but keeps NAs
+Blue_tits_final <- Blue_tits_cleaned %>% 
+  filter(site != "TOM") %>%
+  filter(cs <= 16 | is.na(cs)) %>% 
+  mutate(siteyear = paste(site, year))
+
+# 3. Create subsets and site-level medians
+FED_site_medians_exc2020 <- site_means %>% 
+  filter(year != 2020)
+
+FED_Blue_tits_exc_2020 <- Blue_tits_final %>% 
+  filter(year != 2020)
+
+# 4. Clean site details for spatial analysis
+site_details_clean <- site_details %>%
+  dplyr::select(site, Mean.Lat, Mean.Long) %>%
+  dplyr::rename(Lat = Mean.Lat, Lon = Mean.Long)
+
+# 5. Integrate climate data and scale temperature
+Blue_tits_final <- Blue_tits_final %>%
+  left_join(climate_data %>% select(site, year, mean_temp), by = c("site", "year")) %>%
+  mutate(mean_temp_z = as.numeric(scale(mean_temp)))
+
+FED_Blue_tits_exc_2020 <- FED_Blue_tits_exc_2020 %>%
+  left_join(climate_data %>% select(site, year, mean_temp), by = c("site", "year")) %>%
+  mutate(mean_temp_z = as.numeric(scale(mean_temp)))
+
+# 6. Create site temperature summary
+site_temp_summary <- climate_data %>%
+  group_by(site) %>%
+  summarise(mean_temp_overall = mean(mean_temp, na.rm = TRUE), .groups = "drop")
+```
+
+
+```{r extract-baseline-iccs}
+# Raw data ICCs (PRIMARY — reported in main results)
+fed_icc2 <- icc_baseline$icc[icc_baseline$trait == "FED" & icc_baseline$model == "raw_data"]
+cs_icc2  <- icc_baseline$icc[icc_baseline$trait == "CS"  & icc_baseline$model == "raw_data"]
+suc_icc2 <- icc_baseline$icc[icc_baseline$trait == "SUC" & icc_baseline$model == "raw_data"]
+
+# Site-means ICCs (SUPPLEMENTARY — reported in Appendix A6)
+fed_icc  <- icc_baseline$icc[icc_baseline$trait == "FED" & icc_baseline$model == "site_means"]
+cs_icc   <- icc_baseline$icc[icc_baseline$trait == "CS"  & icc_baseline$model == "site_means"]
+suc_icc  <- icc_baseline$icc[icc_baseline$trait == "SUC" & icc_baseline$model == "site_means"]
+```
+
+# 3. Distance-decay of spatial synchrony — Aim 2
+
+## 3.1 Model fitting
+
+```{r prepare-data-function}
+prepare_data <- function(x, f) {
+  x %>%
+    dplyr::group_by(site) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+      mod = purrr::map(.x = data, .f = ~ lm(f, data = .)),
+      aug = purrr::map2(.x = mod, .y = data,
+                        .f = ~ broom::augment_columns(.x, .y))
+    ) %>%
+    tidyr::unnest(aug) %>%
+    dplyr::select(site, year, .resid) %>%
+    tidyr::pivot_wider(names_from = site, values_from = .resid) %>%
+    dplyr::arrange(year) %>%
+    dplyr::select(-year) %>%
+    scale(.) ->
+    mat
+  return(mat[rowSums(!is.na(mat)) > 1, ])
+}
+```
+
+```{r prepare-trait-matrices}
+mat_fed_detrended <- prepare_data(
+  x = FED_site_medians_exc2020 %>% select(site, year, median_fed) %>% drop_na(),
+  f = formula(median_fed ~ year))
+
+mat_cs_detrended <- prepare_data(
+  x = site_means %>% select(site, year, mean_cs) %>% drop_na(),
+  f = formula(mean_cs ~ year))
+
+mat_suc_detrended <- prepare_data(
+  x = site_means %>% select(site, year, mean_suc) %>% drop_na(),
+  f = formula(mean_suc ~ year))
+```
+
+```{r calculate-distances}
+calculate_distances <- function(x, y) {
+  l <- x %>% dplyr::filter(site %in% colnames(y))
+  dist <- ncf::gcdist(x = l$Lon, y = l$Lat)
+  return(dist)
+}
+
+dist_fed <- calculate_distances(x = site_details_clean, y = mat_fed_detrended)
+dist_cs  <- calculate_distances(x = site_details_clean, y = mat_cs_detrended)
+dist_suc <- calculate_distances(x = site_details_clean, y = mat_suc_detrended)
+```
+
+```{r spatial-synchrony-function}
+calculate_sp_syn <- function(x, d, start, boot_prog = NULL) {
+  if (!is.null(boot_prog)) { boot_prog$tick() }
+  gauss_sp_autocorr <- function(par, x, d) {
+    rho.0   <- exp(par[1]) / (1 + exp(par[1]))
+    rho.inf <- rho.0 * exp(par[2]) / (1 + exp(par[2]))
+    l       <- exp(par[3])
+    logLL <- 0
+    for (i in 1:nrow(x)) {
+      xx  <- x[i, ]
+      sel <- !is.na(xx)
+      dsel <- d[sel, sel]
+      xx   <- xx[sel]
+      mu <- rep(0, length(xx))
+      sigma <- (rho.0 - rho.inf) * exp(-(dsel^2) / (2 * l^2)) + rho.inf
+      diag(sigma) <- 1
+      logLL <- logLL + -sum(mvtnorm::dmvnorm(x = xx, mean = mu, sigma = sigma, log = TRUE))
+    }
+    return(logLL)
+  }
+  num_opt <- optim(start, gauss_sp_autocorr, x = x, d = d)
+  par_est <- list(
+    rho.0   = exp(num_opt$par[1]) / (1 + exp(num_opt$par[1])),
+    rho.inf = exp(num_opt$par[1]) / (1 + exp(num_opt$par[1])) *
+              exp(num_opt$par[2]) / (1 + exp(num_opt$par[2])),
+    l       = exp(num_opt$par[3])
+  )
+  return(list(start = start, num_opt = num_opt, par_est = par_est))
+}
+```
+
+```{r run-spatial-synchrony-models}
+start <- c(log(0.75 / (1 - 0.75)), log(0.1 / (1 - 0.1)), log(500))
+ss_fed <- calculate_sp_syn(x = mat_fed_detrended, d = dist_fed, start = start)
+ss_cs  <- calculate_sp_syn(x = mat_cs_detrended,  d = dist_cs,  start = start)
+ss_suc <- calculate_sp_syn(x = mat_suc_detrended, d = dist_suc, start = start)
+```
+
+```{r gauss-equation}
+gauss_sp_autocorr_eq <- function(rho.0, rho.inf, d, l) {
+  (rho.0 - rho.inf) * exp(-(d^2) / (2 * l^2)) + rho.inf
+}
+```
+
+## 3.2 Bootstrapping
+
+```{r bootstrap-function}
+bootstrap_sp_syn <- function(x, y, d, start, n) {
+  start.time <- Sys.time()
+  rho.0 <- y$par_est$rho.0; rho.inf <- y$par_est$rho.inf; l <- y$par_est$l
+  sigma <- (rho.0 - rho.inf) * exp(-(d^2) / (2 * l^2)) + rho.inf
+  diag(sigma) <- 1
+  pb1 <- progress::progress_bar$new(total = n, format = "Drawing [:bar] :percent ~:eta remaining", clear = FALSE)
+  cat(paste0("\nDrawing ", n, " bootstrap replicates...\n"))
+  boot <- list()
+  for (i in 1:n) {
+    pb1$tick()
+    rep <- mvtnorm::rmvnorm(n = nrow(x), mean = rep(0, nrow(sigma)), sigma = sigma)
+    rep[is.na(x)] <- NA
+    boot[[i]] <- rep
+  }
+  pb2 <- progress::progress_bar$new(total = n, format = "Fitting  [:bar] :percent ~:eta remaining", clear = FALSE)
+  cat("\nRe-estimating parameters on each bootstrap replicate...\n")
+  ss_boot <- purrr::map(.x = boot, .f = ~ calculate_sp_syn(x = .x, d = d, start = start, boot_prog = pb2))
+  time <- difftime(Sys.time(), start.time, units = "min")
+  cat(paste0("\nAll ", n, " bootstraps completed in ", round(time, 2), " minutes\n"))
+  return(list(output = ss_boot, time = time))
+}
+```
+
+```{r run-bootstraps, cache=TRUE}
+set.seed(42)
+# Run only if the saved file doesn't exist yet
+if (!file.exists("boot_results_aim2.rds")) {
+  n_boot <- 5000
+  boot_fed <- bootstrap_sp_syn(x = mat_fed_detrended, y = ss_fed, 
+                                d = dist_fed, start = start, n = n_boot)
+  boot_cs  <- bootstrap_sp_syn(x = mat_cs_detrended,  y = ss_cs,  
+                                d = dist_cs,  start = start, n = n_boot)
+  boot_suc <- bootstrap_sp_syn(x = mat_suc_detrended, y = ss_suc, 
+                                d = dist_suc, start = start, n = n_boot)
+  
+  saveRDS(list(boot_fed = boot_fed, 
+               boot_cs  = boot_cs, 
+               boot_suc = boot_suc,
+               n_boot   = n_boot), 
+          "boot_results_aim2.rds")
+}
+
+# Always load from file
+boots     <- readRDS("boot_results_aim2.rds")
+boot_fed  <- boots$boot_fed
+boot_cs   <- boots$boot_cs
+boot_suc  <- boots$boot_suc
+n_boot    <- boots$n_boot
+```
+
+## 3.3 Distance-decay results
+
+```{r bootstrap-parameter-summary}
+extract_boot_params <- function(boot_output, trait_label) {
+  dplyr::bind_rows(purrr::map(boot_output$output, 3)) %>% mutate(Trait = trait_label)
+}
+boot_params <- bind_rows(
+  extract_boot_params(boot_fed, "Lay date"),
+  extract_boot_params(boot_cs,  "Clutch size"),
+  extract_boot_params(boot_suc, "Fledgling success"))
+
+boot_summary <- boot_params %>%
+  mutate(Trait = factor(Trait, levels = c("Lay date", "Clutch size", "Fledgling success"))) %>%
+  group_by(Trait) %>%
+  summarise(
+    `Median`   = round(median(rho.0), 3),
+    `95% CI`   = paste0("[", round(quantile(rho.0, 0.025), 3), ", ",
+                         round(quantile(rho.0, 0.975), 3), "]"),
+    `Median ` = round(median(rho.inf), 3),
+    `95% CI ` = paste0("[", round(quantile(rho.inf, 0.025), 3), ", ",
+                         round(quantile(rho.inf, 0.975), 3), "]"),
+    `Median  `  = round(median(l), 1),
+    `95% CI  `  = paste0("[", round(quantile(l, 0.025), 1), ", ",
+                          round(quantile(l, 0.975), 1), "]")
+  )
+
+kable(boot_summary, align = "lcccccc",
+      caption = paste0("**Table 3.** Bootstrapped parameter estimates for the Gaussian spatial autocorrelation model (n = ", n_boot, ").")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  add_header_above(c(" " = 1, 
+                     "ρ₀ (zero-distance)" = 2, 
+                     "ρ∞ (infinite-distance)" = 2, 
+                     "l (spatial scale, km)" = 2))
+```
+```{r inline-CI-code}
+# ρ₀ CIs
+fed_rho0_ci <- paste0("[", round(quantile(boot_params$rho.0[boot_params$Trait == "Lay date"], 0.025), 3), ", ", round(quantile(boot_params$rho.0[boot_params$Trait == "Lay date"], 0.975), 3), "]")
+cs_rho0_ci <- paste0("[", round(quantile(boot_params$rho.0[boot_params$Trait == "Clutch size"], 0.025), 3), ", ", round(quantile(boot_params$rho.0[boot_params$Trait == "Clutch size"], 0.975), 3), "]")
+suc_rho0_ci <- paste0("[", round(quantile(boot_params$rho.0[boot_params$Trait == "Fledgling success"], 0.025), 3), ", ", round(quantile(boot_params$rho.0[boot_params$Trait == "Fledgling success"], 0.975), 3), "]")
+
+# ρ∞ CIs
+fed_rho.inf_ci <- paste0("[", round(quantile(boot_params$rho.inf[boot_params$Trait == "Lay date"], 0.025), 3), ", ", round(quantile(boot_params$rho.inf[boot_params$Trait == "Lay date"], 0.975), 3), "]")
+cs_rho.inf_ci <- paste0("[", round(quantile(boot_params$rho.inf[boot_params$Trait == "Clutch size"], 0.025), 3), ", ", round(quantile(boot_params$rho.inf[boot_params$Trait == "Clutch size"], 0.975), 3), "]")
+suc_rho.inf_ci <- paste0("[", round(quantile(boot_params$rho.inf[boot_params$Trait == "Fledgling success"], 0.025), 3), ", ", round(quantile(boot_params$rho.inf[boot_params$Trait == "Fledgling success"], 0.975), 3), "]")
+
+# l CIs (whole numbers for km)
+fed_l_ci <- paste0("[", round(quantile(boot_params$l[boot_params$Trait == "Lay date"], 0.025), 0), ", ", round(quantile(boot_params$l[boot_params$Trait == "Lay date"], 0.975), 0), "]")
+cs_l_ci <- paste0("[", round(quantile(boot_params$l[boot_params$Trait == "Clutch size"], 0.025), 0), ", ", round(quantile(boot_params$l[boot_params$Trait == "Clutch size"], 0.975), 0), "]")
+suc_l_ci <- paste0("[", round(quantile(boot_params$l[boot_params$Trait == "Fledgling success"], 0.025), 0), ", ", round(quantile(boot_params$l[boot_params$Trait == "Fledgling success"], 0.975), 0), "]")
+```
+
+
+```{r plot-bootstrap-function}
+plot_bootstrap_sp_syn <- function(x, y, d, trait_label, trait_colour = "steelblue") {
+  boot <- dplyr::bind_rows(purrr::map(y$output, 3))
+  ss_curves <- purrr::pmap(
+    .l = list(boot$rho.0, boot$rho.inf, boot$l),
+    .f = ~ gauss_sp_autocorr_eq(..1, ..2, seq(0, max(d), length.out = 2000), ..3)
+  ) %>% do.call(rbind, .)
+  syn_data <- tibble(
+    Dist   = seq(0, max(d), length.out = 2000),
+    Low    = matrixStats::colQuantiles(x = ss_curves, probs = 0.025),
+    Median = matrixStats::colQuantiles(x = ss_curves, probs = 0.5),
+    High   = matrixStats::colQuantiles(x = ss_curves, probs = 0.975))
+  cor_data <- tibble(
+    Corr = corrr::stretch(corrr::correlate(x))$r,
+    Dist = reshape2::melt(data = d)$value) %>% drop_na()
+  ggplot() +
+    geom_hline(yintercept = 0, color = "gray70", linetype = "dashed") +
+    geom_point(data = cor_data, aes(x = Dist, y = Corr), color = "black", alpha = 0.08, size = 1.5) +
+    geom_ribbon(data = syn_data, aes(x = Dist, ymin = Low, ymax = High), fill = trait_colour, alpha = 0.3, linetype = 0) +
+    geom_line(data = syn_data, aes(x = Dist, y = Median), color = trait_colour, linewidth = 1.1) +
+    scale_y_continuous(limits = c(-1, 1), breaks = seq(-1, 1, by = 0.25)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+    labs(title = trait_label, x = "Distance (km)", y = "Correlation") +
+    theme_classic(base_size = 13, base_family = "Palatino") +
+    theme(plot.title = element_text(face = "bold", family = "Palatino", size = 14))
+}
+```
+
+```{r figure-5-bootstraps, fig.width = 12, fig.height = 5, fig.cap = "**Figure 5.** Bootstrapped Gaussian distance-decay curves for spatial synchrony in (a) lay date, (b) clutch size, and (c) fledgling success. Solid coloured line = median; shaded area surrounding curve = 95% CI. Grey points = raw pairwise correlations between detrended site time series."}
+p_fed_boot <- plot_bootstrap_sp_syn(mat_fed_detrended, boot_fed, dist_fed, "Lay date",          "steelblue")
+p_cs_boot  <- plot_bootstrap_sp_syn(mat_cs_detrended,  boot_cs,  dist_cs,  "Clutch size",       "#57A85A")
+p_suc_boot <- plot_bootstrap_sp_syn(mat_suc_detrended, boot_suc, dist_suc, "Fledgling success", "#E07B4F")
+
+p_fed_boot + p_cs_boot + p_suc_boot +
+  plot_annotation(tag_levels = "a",
+                  tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(size = 12, family = "Palatino", face = "bold"))
+```
+
+***

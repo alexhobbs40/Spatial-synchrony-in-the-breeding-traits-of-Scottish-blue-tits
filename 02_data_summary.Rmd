@@ -1,0 +1,265 @@
+---
+title: "02 — Data summary statistics"
+author: "Alexander Hobbs"
+output: html_document
+---
+
+<!--
+Reports overall and trait-specific sample sizes, completeness statistics,
+and the data-driven justification for excluding the Tomatin (TOM) site
+and the 2020 lay-date data. All summaries reported in the dissertation
+methods (§2.2) and results (§3) sections.
+
+Inputs (from data/, produced by 01_data_cleaning.Rmd):
+  - Blue_tits_final.csv
+  - Blue_tits_cleaned.csv
+  - FED_Blue_tits_exc_2020.csv
+  - Pairwise_distance_km.csv (produced by 03_pairwise_distances.Rmd)
+
+For per-site-year aggregates (site_means, FED_site_means_exc2020),
+this script expects them to exist in the workspace from a prior
+session, OR can be regenerated from the inputs above.
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+```
+
+```{r load-data}
+Blue_tits_final        <- read.csv("data/Blue_tits_final.csv",
+                                   stringsAsFactors = FALSE)
+Blue_tits_cleaned      <- read.csv("data/Blue_tits_cleaned.csv",
+                                   stringsAsFactors = FALSE)
+FED_Blue_tits_exc_2020 <- read.csv("data/FED_Blue_tits_exc_2020.csv",
+                                   stringsAsFactors = FALSE)
+Pairwise_distance_km   <- read.csv("data/Pairwise_distance_km.csv",
+                                   stringsAsFactors = FALSE)
+
+# Build site-level aggregates needed in summary sections below
+site_means <- Blue_tits_final %>%
+  group_by(site, year) %>%
+  summarise(mean_cs  = mean(cs,  na.rm = TRUE),
+            mean_suc = mean(suc, na.rm = TRUE),
+            .groups  = "drop")
+
+FED_site_means_exc2020 <- FED_Blue_tits_exc_2020 %>%
+  group_by(site, year) %>%
+  summarise(median_fed = median(fed, na.rm = TRUE),
+            .groups    = "drop")
+
+FED_site_medians_exc2020 <- FED_site_means_exc2020
+```
+
+## 1. Overall sample sizes
+
+```{r sample-sizes}
+n_nests   <- nrow(Blue_tits_final)
+n_sites   <- n_distinct(Blue_tits_final$site)
+n_years   <- n_distinct(Blue_tits_final$year)
+n_fed     <- sum(!is.na(FED_Blue_tits_exc_2020$fed))
+n_cs      <- sum(!is.na(Blue_tits_final$cs))
+n_suc     <- sum(!is.na(Blue_tits_final$suc))
+
+cat("Total nests:", n_nests, "\n",
+    "Sites:", n_sites, "| Years:", n_years, "\n",
+    "FED obs:", n_fed, "| CS obs:", n_cs, "| SUC obs:", n_suc, "\n")
+```
+
+## 2. Per-site-year sample sizes
+
+```{r site-year-sizes}
+site_year_n <- Blue_tits_final %>%
+  group_by(site, year) %>%
+  summarise(n = n(), .groups = "drop")
+
+cat("Nests per site-year — min:", min(site_year_n$n),
+    "| max:", max(site_year_n$n),
+    "| mean:", round(mean(site_year_n$n), 1), "\n")
+```
+
+## 3. Annual coefficient of variation per trait
+
+```{r annual-cv}
+annual_cv <- bind_rows(
+  FED_site_medians_exc2020 %>%
+    group_by(year) %>%
+    summarise(cv = sd(median_fed, na.rm = TRUE) / mean(median_fed, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(trait = "FED"),
+  site_means %>%
+    group_by(year) %>%
+    summarise(cv = sd(mean_cs, na.rm = TRUE) / mean(mean_cs, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(trait = "CS"),
+  site_means %>%
+    group_by(year) %>%
+    summarise(cv = sd(mean_suc, na.rm = TRUE) / mean(mean_suc, na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(trait = "SUC")
+)
+
+annual_cv %>%
+  group_by(trait) %>%
+  summarise(mean_cv = round(mean(cv), 3), .groups = "drop") %>%
+  kable(caption = "Mean coefficient of variation across years, per trait")
+```
+
+## 4. Trait summary table
+
+```{r trait-summary}
+trait_summary <- tibble(
+  Trait   = c("First egg date", "Clutch size", "Fledgling success"),
+  n       = c(n_fed, n_cs, n_suc),
+  Mean    = c(mean(FED_Blue_tits_exc_2020$fed, na.rm = TRUE),
+              mean(Blue_tits_final$cs,  na.rm = TRUE),
+              mean(Blue_tits_final$suc, na.rm = TRUE)),
+  Median  = c(median(FED_Blue_tits_exc_2020$fed, na.rm = TRUE),
+              median(Blue_tits_final$cs,  na.rm = TRUE),
+              median(Blue_tits_final$suc, na.rm = TRUE)),
+  SD      = c(sd(FED_Blue_tits_exc_2020$fed, na.rm = TRUE),
+              sd(Blue_tits_final$cs,  na.rm = TRUE),
+              sd(Blue_tits_final$suc, na.rm = TRUE)),
+  Min     = c(min(FED_Blue_tits_exc_2020$fed, na.rm = TRUE),
+              min(Blue_tits_final$cs,  na.rm = TRUE),
+              min(Blue_tits_final$suc, na.rm = TRUE)),
+  Max     = c(max(FED_Blue_tits_exc_2020$fed, na.rm = TRUE),
+              max(Blue_tits_final$cs,  na.rm = TRUE),
+              max(Blue_tits_final$suc, na.rm = TRUE))
+) %>%
+  mutate(across(Mean:Max, ~ round(.x, 2)))
+
+kable(trait_summary,
+      caption = "Summary statistics for reproductive traits across all site-years.")
+```
+
+## 5. Nest failure rate
+
+```{r nest-failures}
+nest_failure_summary <- Blue_tits_final %>%
+  drop_na(suc) %>%
+  summarise(
+    total_nests      = n(),
+    failed_nests     = sum(suc == 0),
+    failure_rate_pct = round((failed_nests / total_nests) * 100, 2)
+  )
+
+print(nest_failure_summary)
+```
+
+## 6. Distance summary
+
+```{r distance-summary}
+cat("Site pairs:", nrow(Pairwise_distance_km), "\n",
+    "Distance range:", round(min(Pairwise_distance_km$distance_km), 1),
+    "-", round(max(Pairwise_distance_km$distance_km), 1), "km\n",
+    "Mean:", round(mean(Pairwise_distance_km$distance_km), 1), "km\n",
+    "Median:", round(median(Pairwise_distance_km$distance_km), 1), "km\n")
+```
+
+## 7. Site-year coverage by trait and year
+
+```{r coverage}
+coverage <- Blue_tits_final %>%
+  group_by(year) %>%
+  summarise(
+    sites_with_fed = n_distinct(site[!is.na(fed)]),
+    sites_with_cs  = n_distinct(site[!is.na(cs)]),
+    sites_with_suc = n_distinct(site[!is.na(suc)]),
+    .groups        = "drop"
+  )
+
+kable(coverage,
+      caption = "Number of sites with data per year for each trait.")
+```
+
+## 8. Year range and site-year completeness
+
+```{r completeness}
+cat("Year range:", min(Blue_tits_final$year), "-",
+    max(Blue_tits_final$year), "\n")
+
+total_possible   <- n_sites * n_years
+actual_siteyears <- n_distinct(paste(Blue_tits_final$site,
+                                     Blue_tits_final$year))
+cat("Possible site-years:", total_possible, "\n",
+    "Actual site-years:", actual_siteyears, "\n",
+    "Completeness:", round(100 * actual_siteyears / total_possible, 1), "%\n")
+```
+
+## 9. Years per site (justifies TOM exclusion)
+
+```{r tom-justification}
+years_per_site <- Blue_tits_cleaned %>%
+  filter(cs <= 14 | is.na(cs)) %>%
+  group_by(site) %>%
+  summarise(n_years = n_distinct(year), .groups = "drop")
+
+cat("Years per site — min:", min(years_per_site$n_years),
+    "| max:", max(years_per_site$n_years),
+    "| mean:", round(mean(years_per_site$n_years), 2), "\n")
+
+years_per_site %>%
+  arrange(n_years) %>%
+  head(5) %>%
+  kable(caption = "Sites with fewest years of data")
+```
+
+## 10. Post-exclusion sample sizes
+
+```{r post-exclusion}
+cat("\n--- After excluding TOM ---\n")
+cat("Sites:", n_distinct(Blue_tits_final$site), "\n")
+cat("Nests:", nrow(Blue_tits_final), "\n")
+
+cat("\n--- FED after excluding TOM + 2020 ---\n")
+cat("FED obs:", sum(!is.na(FED_Blue_tits_exc_2020$fed)), "\n")
+cat("Sites with FED:", n_distinct(FED_Blue_tits_exc_2020$site[!is.na(FED_Blue_tits_exc_2020$fed)]), "\n")
+cat("Years:", n_distinct(FED_Blue_tits_exc_2020$year[!is.na(FED_Blue_tits_exc_2020$fed)]), "\n")
+```
+
+## 11. Per-trait site-year counts entering each analysis
+
+```{r per-trait-counts}
+siteyear_per_trait <- tibble(
+  Trait = c("FED (excl. 2020)", "CS", "SUC"),
+  `Site-year combinations` = c(
+    FED_site_means_exc2020 %>% drop_na(median_fed) %>% nrow(),
+    site_means %>% drop_na(mean_cs)  %>% nrow(),
+    site_means %>% drop_na(mean_suc) %>% nrow()
+  ),
+  `Sites` = c(
+    FED_site_means_exc2020 %>% drop_na(median_fed) %>% pull(site) %>% n_distinct(),
+    site_means %>% drop_na(mean_cs)  %>% pull(site) %>% n_distinct(),
+    site_means %>% drop_na(mean_suc) %>% pull(site) %>% n_distinct()
+  ),
+  `Years` = c(
+    FED_site_means_exc2020 %>% drop_na(median_fed) %>% pull(year) %>% n_distinct(),
+    site_means %>% drop_na(mean_cs)  %>% pull(year) %>% n_distinct(),
+    site_means %>% drop_na(mean_suc) %>% pull(year) %>% n_distinct()
+  )
+)
+
+kable(siteyear_per_trait,
+      caption = "Site-year combinations entering each synchrony analysis (after all exclusions).")
+```
+
+## 12. 2020 lay-date breakdown (supports exclusion decision)
+
+```{r 2020-fed}
+cat("\n--- 2020 FED breakdown ---\n")
+Blue_tits_final %>%
+  filter(year == 2020) %>%
+  summarise(
+    total_nests_2020  = n(),
+    sites_any_data    = n_distinct(site),
+    fed_obs           = sum(!is.na(fed)),
+    sites_with_fed    = n_distinct(site[!is.na(fed)]),
+    sites_without_fed = n_distinct(site) - n_distinct(site[!is.na(fed)])
+  ) %>%
+  kable(caption = "2020 data summary: justification for FED exclusion")
+```

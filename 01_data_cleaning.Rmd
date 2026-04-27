@@ -1,0 +1,120 @@
+---
+title: "01 — Data cleaning"
+author: "Alexander Hobbs"
+output: html_document
+---
+
+<!--
+This script applies the data exclusion criteria described in the dissertation
+methods (§2.2) to produce the cleaned analysis-ready dataset used by all
+downstream scripts.
+
+Inputs (in data/):
+  - Blue_tits_raw.csv     : raw nest-level Phenoweb data
+  - site_details.csv      : site coordinates and metadata
+
+Outputs (written to data/):
+  - Blue_tits_cleaned.csv : after duplicate removal and clutch-swap exclusion
+  - Blue_tits_final.csv   : after additional analysis-ready filtering
+                            (clutch size <= 16, etc.)
+  - FED_Blue_tits_exc_2020.csv : same as Blue_tits_final but with 2020
+                                 excluded (used for lay-date analyses)
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(geosphere)
+```
+
+# 1. Load raw data
+
+```{r load-raw}
+# Adjust filename to match whatever the raw export from the Phenoweb is called.
+Blue_tits <- read.csv("data/Blue_tits_raw.csv",
+                      stringsAsFactors = TRUE, header = TRUE)
+
+cat("Raw data:", nrow(Blue_tits), "rows\n")
+```
+
+# 2. Remove duplicate nest records
+
+Where the same nest box appears more than once in the same year, retain the
+record with the earliest first-egg date (`fed`).
+
+```{r remove-duplicates}
+Blue_tits_cleaned <- Blue_tits %>%
+  arrange(year, site, box, fed) %>%
+  distinct(year, site, box, .keep_all = TRUE)
+
+# Check no duplicates remain
+n_remaining_dupes <- Blue_tits_cleaned %>%
+  group_by(year, site, box) %>%
+  filter(n() > 1) %>%
+  nrow()
+cat("Duplicates remaining:", n_remaining_dupes, "(should be 0)\n")
+```
+
+# 3. Remove clutch-swap experimental nests
+
+Nests with `ClutchSwapTreatment == 1` were part of an experimental manipulation
+(2017–2019) and have their fledgling success values set to `NA` so they
+do not contribute to natural-variation estimates.
+
+```{r exclude-clutch-swap}
+Blue_tits_cleaned <- Blue_tits_cleaned %>%
+  mutate(suc = ifelse(ClutchSwapTreatment == 1, NA, suc))
+```
+
+# 4. Apply analysis-ready filters
+
+Exclude the Tomatin (TOM) site (insufficient occupancy across years) and
+clutches > 16 eggs (biologically implausible — typically two-female clutches).
+
+```{r analysis-filters}
+Blue_tits_final <- Blue_tits_cleaned %>%
+  filter(site != "TOM",
+         is.na(cs) | cs <= 16)
+
+cat("Final dataset:", nrow(Blue_tits_final), "rows across",
+    n_distinct(Blue_tits_final$site), "sites and",
+    n_distinct(Blue_tits_final$year), "years\n")
+```
+
+# 5. Build lay-date subset excluding 2020
+
+Lay-date analyses exclude 2020 due to reduced fieldwork during COVID-19,
+which produced a non-representative subset of late nests.
+
+```{r exclude-2020-fed}
+FED_Blue_tits_exc_2020 <- Blue_tits_final %>%
+  filter(year != 2020)
+
+# Add site-year combination column used in downstream scripts
+FED_Blue_tits_exc_2020$siteyear <- paste(FED_Blue_tits_exc_2020$site,
+                                          FED_Blue_tits_exc_2020$year)
+```
+
+# 6. Per-trait sample sizes
+
+```{r sample-sizes}
+Blue_tits_final %>%
+  summarise(
+    n_lay_date          = sum(!is.na(fed)),
+    n_clutch_size       = sum(!is.na(cs)),
+    n_fledgling_success = sum(!is.na(suc))
+  )
+```
+
+# 7. Save cleaned datasets for downstream scripts
+
+```{r save-outputs}
+write.csv(Blue_tits_cleaned,        "data/Blue_tits_cleaned.csv",        row.names = FALSE)
+write.csv(Blue_tits_final,          "data/Blue_tits_final.csv",          row.names = FALSE)
+write.csv(FED_Blue_tits_exc_2020,   "data/FED_Blue_tits_exc_2020.csv",   row.names = FALSE)
+
+cat("Saved 3 files to data/\n")
+```
