@@ -6,7 +6,7 @@ output: html_document
 
 <!--
 This script applies the data exclusion criteria described in the dissertation
-methods (§2.2) to produce the cleaned analysis-ready dataset used by all
+methods to produce the cleaned analysis-ready dataset used by all
 downstream scripts.
 
 Inputs (in data/):
